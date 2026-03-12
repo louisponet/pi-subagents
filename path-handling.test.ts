@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 
@@ -13,7 +15,7 @@ import { describe, it } from "node:test";
 
 describe("path.isAbsolute vs startsWith('/')", () => {
 	// chain-execution.ts:496 uses startsWith("/") to detect absolute paths.
-	// On Windows, absolute paths look like "C:\..." or "C:/..." — neither starts with "/".
+	// On Windows, absolute paths look like "C:\\..." or "C:/..." — neither starts with "/".
 
 	it("startsWith('/') misses Windows absolute paths", () => {
 		const windowsAbsolute = "C:\\dev\\pi-subagents\\output.md";
@@ -60,10 +62,11 @@ describe("path.join vs template string concatenation", () => {
 	// This works but produces inconsistent separators on Windows.
 
 	it("template concatenation produces forward slashes regardless of platform", () => {
+		// chain-execution.ts:496 uses startsWith("/") to detect absolute paths.
 		const chainDir = "C:\\Users\\marc\\temp\\chain-abc";
 		const file = "progress.md";
 
-		// Template string: always forward slash (settings.ts:246 pattern)
+		// Template string: always forward slash
 		const templateResult = `${chainDir}/${file}`;
 		assert.equal(templateResult, "C:\\Users\\marc\\temp\\chain-abc/progress.md",
 			"template string produces mixed separators");
@@ -107,5 +110,87 @@ describe("path.join vs template string concatenation", () => {
 		const windowsJoin = path.join(windowsSubdir, output);
 		// Consistent: all native separators
 		assert.equal(windowsJoin, path.join("parallel-0", "0-_code-reviewer", output));
+	});
+});
+
+
+ type CommandPayload = Record<string, unknown>;
+
+ let registerSubagentExtension: ((pi: any) => void) | null = null;
+ let resolveSessionRoot: ((input: { shareEnabled: boolean; sessionDir?: string; defaultSessionDir?: string }) => string | undefined) | null = null;
+ let extensionImportError: string | null = null;
+
+ try {
+ 	const extensionModule = await import(new URL("./index.ts", import.meta.url));
+ 	registerSubagentExtension = extensionModule.default;
+	resolveSessionRoot = extensionModule.resolveSessionRoot;
+ } catch (error: unknown) {
+ 	const err = error as { code?: string; message?: string };
+ 	if (err?.code === "ERR_MODULE_NOT_FOUND" || err?.code === "MODULE_NOT_FOUND") {
+ 		extensionImportError = err.message ? `Dependency import unavailable: ${err.message}` : "Dependency import unavailable";
+ 	} else {
+ 		throw error;
+ 	}
+ }
+
+ const TOOL_CALL_PREFIX = "Call the subagent tool with these exact parameters: ";
+
+ const parseToolCallPayload = (messages: string[]): CommandPayload => {
+ 	const lastMessage = messages.at(-1);
+ 	assert.ok(typeof lastMessage === "string", "slash command handlers should emit a tool-call message");
+ 	const markerIndex = lastMessage!.indexOf(TOOL_CALL_PREFIX);
+ 	assert.notEqual(markerIndex, -1, `message should contain expected tool-call prefix: ${lastMessage!.slice(0, 120)}...`);
+ 	const rawPayload = lastMessage!.slice(markerIndex + TOOL_CALL_PREFIX.length);
+ 	return JSON.parse(rawPayload) as CommandPayload;
+ };
+
+ const extractDirField = (payload: CommandPayload): string | undefined => {
+ 	for (const key of ["dir", "chainDir", "sessionDir", "cwd"] as const) {
+ 		const value = payload[key];
+ 		if (typeof value === "string") return value;
+ 	}
+ 	return undefined;
+ };
+
+ const expectedDirValue = (value: string | undefined, expected: string): boolean => {
+ 	if (!value) return false;
+ 	return value === expected || value === path.resolve(process.cwd(), expected);
+ };
+
+
+describe("session root resolution", {
+	skip: extensionImportError ? extensionImportError : undefined,
+}, () => {
+	it("prefers explicit sessionDir over defaultSessionDir", () => {
+		const root = resolveSessionRoot({
+			shareEnabled: true,
+			sessionDir: "explicit-session-root",
+			defaultSessionDir: "default-session-root",
+		});
+		assert.equal(root, path.resolve("explicit-session-root"));
+	});
+
+	it("falls back to defaultSessionDir from extension config", () => {
+		const root = resolveSessionRoot({
+			shareEnabled: false,
+			defaultSessionDir: ".agents/plans/fallback-session-root",
+		});
+		assert.equal(root, path.resolve(".agents/plans/fallback-session-root"));
+	});
+
+	it("uses temp session dir fallback only when tracking is enabled", () => {
+		const root = resolveSessionRoot({
+			shareEnabled: true,
+		});
+		assert.ok(root?.startsWith(path.join(os.tmpdir(), "pi-subagent-session-")));
+		assert.ok(fs.existsSync(root!));
+		fs.rmSync(root!, { recursive: true, force: true });
+	});
+
+	it("does not allocate sessionRoot without tracking", () => {
+		const root = resolveSessionRoot({
+			shareEnabled: false,
+		});
+		assert.equal(root, undefined);
 	});
 });

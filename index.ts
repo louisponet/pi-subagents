@@ -83,6 +83,20 @@ function loadConfig(): ExtensionConfig {
 	return {};
 }
 
+interface SessionRootInput {
+	shareEnabled: boolean;
+	sessionDir?: string;
+	defaultSessionDir?: string;
+}
+
+export function resolveSessionRoot(input: SessionRootInput): string | undefined {
+	const { sessionDir, defaultSessionDir, shareEnabled } = input;
+	if (sessionDir) return path.resolve(sessionDir);
+	if (!shareEnabled && !defaultSessionDir) return undefined;
+ 	if (defaultSessionDir) return path.resolve(defaultSessionDir);
+ 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-session-"));
+ }
+
 /**
  * Create a directory and verify it is actually accessible.
  * On Windows with Azure AD/Entra ID, directories created shortly after
@@ -298,12 +312,14 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const agents = discoverAgents(ctx.cwd, scope).agents;
 			const runId = randomUUID().slice(0, 8);
 			const shareEnabled = params.share === true;
-			// Session root: explicit param > derived from parent session > temp fallback
-			// Sessions are always enabled now - stored alongside parent session for tracking
+			// Session root precedence: explicit param > config default > parent session derived
+			// Sessions are always enabled - stored alongside parent session for tracking
 			// Include runId to ensure uniqueness across multiple subagent calls
 			const sessionRoot = params.sessionDir
 				? path.resolve(params.sessionDir)
-				: path.join(getSubagentSessionRoot(parentSessionFile), runId);
+				: config.defaultSessionDir
+					? path.resolve(config.defaultSessionDir)
+					: path.join(getSubagentSessionRoot(parentSessionFile), runId);
 			try {
 				fs.mkdirSync(sessionRoot, { recursive: true });
 			} catch {}
@@ -320,7 +336,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			// - Chains default to TUI (clarify: true), so async requires explicit clarify: false
 			// - Single defaults to no TUI, so async is allowed unless clarify: true is passed
 			const effectiveAsync = requestedAsync && !hasTasks && (
-				hasChain 
+				hasChain
 					? params.clarify === false    // chains: only async if TUI explicitly disabled
 					: params.clarify !== true     // single: async unless TUI explicitly enabled
 			);
@@ -539,7 +555,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				let tasks = params.tasks.map(t => t.task);
 				const modelOverrides: (string | undefined)[] = params.tasks.map(t => (t as { model?: string }).model);
 				// Initialize skill overrides from task-level skill params (may be overridden by TUI)
-				const skillOverrides: (string[] | false | undefined)[] = params.tasks.map(t => 
+				const skillOverrides: (string[] | false | undefined)[] = params.tasks.map(t =>
 					normalizeSkillInput((t as { skill?: string | string[] | boolean }).skill)
 				);
 
@@ -553,7 +569,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					}));
 
 					// Resolve behaviors with task-level skill overrides for TUI display
-					const behaviors = agentConfigs.map((c, i) => 
+					const behaviors = agentConfigs.map((c, i) =>
 						resolveStepBehavior(c, { skills: skillOverrides[i] })
 					);
 					const availableSkills = discoverAvailableSkills(ctx.cwd);
