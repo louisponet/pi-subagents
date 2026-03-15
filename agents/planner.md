@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Creates implementation plans from context and requirements
-tools: read, grep, find, ls, write
+tools: read, grep, find, ls, write, muninn_recall, muninn_remember, muninn_remember_batch
 model: claude-opus-4-6
 thinking: high
 output: plan.md

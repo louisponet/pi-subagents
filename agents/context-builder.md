@@ -1,7 +1,7 @@
 ---
 name: context-builder
 description: Analyzes requirements and codebase, generates context and meta-prompt
-tools: read, grep, find, ls, bash, web_search
+tools: read, grep, find, ls, bash, web_search, muninn_recall, muninn_remember, muninn_remember_batch
 model: claude-sonnet-4-6
 output: context.md
 ---

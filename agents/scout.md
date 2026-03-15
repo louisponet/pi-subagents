@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Fast codebase recon that returns compressed context for handoff
-tools: read, grep, find, ls, bash, write
+tools: read, grep, find, ls, bash, write, muninn_recall, muninn_remember, muninn_remember_batch
 model: anthropic/claude-haiku-4-5
 output: context.md
 defaultProgress: true

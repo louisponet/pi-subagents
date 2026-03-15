@@ -2,6 +2,7 @@
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
 model: claude-sonnet-4-6
+tools: read, grep, find, ls, bash, write, muninn_recall, muninn_remember, muninn_remember_batch
 defaultReads: context.md, plan.md
 defaultProgress: true
 ---

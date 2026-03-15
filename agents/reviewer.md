@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Code review specialist that validates implementation and fixes issues
-tools: read, grep, find, ls, bash
+tools: read, grep, find, ls, bash, muninn_recall, muninn_remember, muninn_remember_batch
 model: openai-codex/gpt-5.3-codex
 thinking: high
 defaultReads: plan.md, progress.md
