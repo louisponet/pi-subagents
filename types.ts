@@ -157,6 +157,7 @@ export interface AsyncStatus {
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	sessionId?: string;
 }
 
 export interface AsyncJobState {
@@ -173,6 +174,8 @@ export interface AsyncJobState {
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	/** stdin writer for sending RPC steering commands to the runner process */
+	stdinWriter?: (data: string) => boolean;
 }
 
 // ============================================================================

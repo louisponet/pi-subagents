@@ -97,24 +97,115 @@ function parseSessionTokens(sessionDir: string): TokenUsage | null {
 	}
 }
 
+/**
+ * Extract final assistant text response from RPC mode JSONL event stream.
+ * Finds the last message_end event with role=assistant and returns text content.
+ */
+function extractRpcOutput(rawStdout: string): string {
+	let lastAssistantText = "";
+	for (const line of rawStdout.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			const event = JSON.parse(trimmed) as {
+				type: string;
+				message?: {
+					role?: string;
+					content?: Array<{ type: string; text?: string }>;
+				};
+			};
+			if (
+				event.type === "message_end" &&
+				event.message?.role === "assistant" &&
+				Array.isArray(event.message.content)
+			) {
+				const texts = event.message.content
+					.filter((c) => c.type === "text" && c.text)
+					.map((c) => c.text as string);
+				if (texts.length > 0) {
+					lastAssistantText = texts.join("\n");
+				}
+			}
+		} catch {
+			// skip malformed lines
+		}
+	}
+	return lastAssistantText;
+}
+
+/**
+ * Spawn pi and stream its output to outputFile.
+ *
+ * @param args     CLI arguments for pi (without the task arg in RPC mode)
+ * @param rpcPrompt When provided, use RPC mode: send task via stdin JSON and relay
+ *                  steering commands from process.stdin to child.stdin.
+ *                  The child process is killed after agent_end is detected.
+ */
 function runPiStreaming(
 	args: string[],
 	cwd: string,
 	outputFile: string,
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
+	rpcPrompt?: string,
 ): Promise<{ stdout: string; exitCode: number | null }> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv() };
 		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
-		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
-		let stdout = "";
+
+		const stdinMode = rpcPrompt !== undefined ? "pipe" : "ignore";
+		const child = spawn(spawnSpec.command, spawnSpec.args, {
+			cwd,
+			stdio: [stdinMode, "pipe", "pipe"],
+			env: spawnEnv,
+		});
+
+		let rawStdout = "";
+		let rpcLineBuffer = "";
+		let agentEndReceived = false;
+		let killedAfterAgentEnd = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let stdinRelay: ((chunk: Buffer) => void) | undefined;
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
-			stdout += text;
+			rawStdout += text;
 			outputStream.write(text);
+
+			// In RPC mode: parse JSONL events to detect task completion or cancellation
+			if (rpcPrompt !== undefined) {
+				rpcLineBuffer += text;
+				const lines = rpcLineBuffer.split("\n");
+				rpcLineBuffer = lines.pop() ?? "";
+				for (const line of lines) {
+					if (!line.trim()) continue;
+					try {
+						const event = JSON.parse(line) as { type: string };
+						if (event.type === "agent_end" && !agentEndReceived) {
+							agentEndReceived = true;
+							// Kill after a brief delay — but cancel if auto_retry_start fires
+							killTimer = setTimeout(() => {
+								killTimer = undefined;
+								if (child.exitCode === null && !child.killed) {
+									killedAfterAgentEnd = true;
+									child.kill("SIGTERM");
+								}
+							}, 500);
+						} else if (event.type === "auto_retry_start") {
+							// Agent is retrying after an error — reset agent_end flag
+							// and cancel any pending kill timer
+							agentEndReceived = false;
+							if (killTimer !== undefined) {
+								clearTimeout(killTimer);
+								killTimer = undefined;
+							}
+						}
+					} catch {
+						// skip malformed lines
+					}
+				}
+			}
 		});
 
 		child.stderr.on("data", (chunk: Buffer) => {
@@ -122,14 +213,58 @@ function runPiStreaming(
 		});
 
 		child.on("close", (exitCode) => {
+			// Clean up kill timer if the process exited before it fired
+			if (killTimer !== undefined) {
+				clearTimeout(killTimer);
+				killTimer = undefined;
+			}
+			// Clean up stdin relay to prevent memory leaks across steps
+			if (stdinRelay) {
+				process.stdin.removeListener("data", stdinRelay);
+				stdinRelay = undefined;
+			}
 			outputStream.end();
-			resolve({ stdout, exitCode });
+			// In RPC mode, extract the final assistant text from JSONL event stream
+			const finalStdout = rpcPrompt !== undefined ? extractRpcOutput(rawStdout) : rawStdout;
+			// When we intentionally killed pi after agent_end, exitCode is null (SIGTERM).
+			// Treat this as success (exitCode 0) since the task completed normally.
+			const resolvedExitCode = killedAfterAgentEnd && exitCode === null ? 0 : exitCode;
+			resolve({ stdout: finalStdout, exitCode: resolvedExitCode });
 		});
 
 		child.on("error", () => {
+			if (killTimer !== undefined) {
+				clearTimeout(killTimer);
+				killTimer = undefined;
+			}
+			if (stdinRelay) {
+				process.stdin.removeListener("data", stdinRelay);
+				stdinRelay = undefined;
+			}
 			outputStream.end();
-			resolve({ stdout, exitCode: 1 });
+			const finalStdout = rpcPrompt !== undefined ? extractRpcOutput(rawStdout) : rawStdout;
+			resolve({ stdout: finalStdout, exitCode: 1 });
 		});
+
+		// Set up RPC mode: send task via stdin and relay steering commands
+		if (rpcPrompt !== undefined && child.stdin) {
+			// Suppress EPIPE errors if the child dies unexpectedly
+			child.stdin.on("error", () => {});
+
+			// Send the initial task as an RPC prompt command
+			const promptMsg = JSON.stringify({ type: "prompt", message: `Task: ${rpcPrompt}`, id: "prompt-001" }) + "\n";
+			child.stdin.write(promptMsg);
+
+			// Relay steering commands from our own stdin (written by the TUI parent via stdinWriter)
+			// to the child pi process stdin so steer/follow_up commands reach the agent
+			stdinRelay = (chunk: Buffer) => {
+				if (child.stdin && !child.stdin.destroyed) {
+					child.stdin.write(chunk);
+				}
+			};
+			process.stdin.on("data", stdinRelay);
+			process.stdin.resume();
+		}
 	});
 }
 
@@ -275,7 +410,9 @@ async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
 ): Promise<{ agent: string; output: string; exitCode: number | null; artifactPaths?: ArtifactPaths }> {
-	const args = ["-p"];
+	// Use RPC mode for async execution: this enables stdin-based steering via the TUI.
+	// The task is sent as an RPC prompt command instead of a CLI argument.
+	const args = ["--mode", "rpc"];
 	if (!ctx.sessionEnabled) {
 		args.push("--no-session");
 	}
@@ -318,16 +455,9 @@ async function runSingleStep(
 
 	const placeholderRegex = new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 	const task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
-
-	const TASK_ARG_LIMIT = 8000;
-	if (task.length > TASK_ARG_LIMIT) {
-		if (!tmpDir) tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		const taskFilePath = path.join(tmpDir, "task.md");
-		fs.writeFileSync(taskFilePath, `Task: ${task}`, { mode: 0o600 });
-		args.push(`@${taskFilePath}`);
-	} else {
-		args.push(`Task: ${task}`);
-	}
+	// Note: in RPC mode, the task is sent via stdin as an RPC prompt command,
+	// not as a CLI argument. This removes the CLI arg length limitation and
+	// enables stdin to remain open for steering commands from the TUI.
 
 	let artifactPaths: ArtifactPaths | undefined;
 	if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false) {
@@ -346,7 +476,8 @@ async function runSingleStep(
 		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
 	}
 
-	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot);
+	// Pass task as rpcPrompt: it will be sent via stdin as {"type":"prompt","message":"Task: <task>","id":"prompt-001"}
+	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot, task);
 
 	if (tmpDir) {
 		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
@@ -436,6 +567,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		gistUrl?: string;
 		shareError?: string;
 		error?: string;
+		sessionId?: string | null;
 	} = {
 		runId: id,
 		mode: flatSteps.length > 1 ? "chain" : "single",
@@ -449,6 +581,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
+		sessionId: config.sessionId ?? null,
 	};
 
 	fs.mkdirSync(asyncDir, { recursive: true });

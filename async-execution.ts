@@ -93,23 +93,50 @@ export function isAsyncAvailable(): boolean {
 }
 
 /**
- * Spawn the async runner process
+ * Result of spawning the async runner process
  */
-function spawnRunner(cfg: object, suffix: string, cwd: string): number | undefined {
-	if (!jitiCliPath) return undefined;
-	
+interface SpawnRunnerResult {
+	pid: number | undefined;
+	/** Write RPC commands to the runner's stdin for steering the subagent. */
+	stdinWriter?: (data: string) => boolean;
+}
+
+/**
+ * Spawn the async runner process.
+ * Uses stdin pipe so the TUI can send steering commands to the running agent.
+ */
+function spawnRunner(cfg: object, suffix: string, cwd: string): SpawnRunnerResult {
+	if (!jitiCliPath) return { pid: undefined };
+
 	const cfgPath = path.join(os.tmpdir(), `pi-async-cfg-${suffix}.json`);
 	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
-	
+
 	const proc = spawn("node", [jitiCliPath, runner, cfgPath], {
 		cwd,
 		detached: true,
-		stdio: "ignore",
+		// stdin is piped so the TUI can send steering commands;
+		// stdout/stderr are ignored (runner writes output to asyncDir files)
+		stdio: ["pipe", "ignore", "ignore"],
 		windowsHide: true,
 	});
 	proc.unref();
-	return proc.pid;
+
+	// Suppress EPIPE errors if the runner exits before we write to it
+	proc.stdin?.on("error", () => {});
+
+	const stdinWriter = proc.stdin
+		? (data: string): boolean => {
+				if (!proc.stdin || proc.stdin.destroyed) return false;
+				try {
+					return proc.stdin.write(data);
+				} catch {
+					return false;
+				}
+			}
+		: undefined;
+
+	return { pid: proc.pid, stdinWriter };
 }
 
 /**
@@ -198,7 +225,7 @@ export function executeAsyncChain(
 	});
 
 	const runnerCwd = cwd ?? ctx.cwd;
-	const pid = spawnRunner(
+	const { pid: chainPid, stdinWriter: chainStdinWriter } = spawnRunner(
 		{
 			id,
 			steps,
@@ -218,14 +245,14 @@ export function executeAsyncChain(
 		runnerCwd,
 	);
 
-	if (pid) {
+	if (chainPid) {
 		const firstStep = chain[0];
 		const firstAgents = isParallelStep(firstStep)
 			? firstStep.parallel.map((t) => t.agent)
 			: [(firstStep as SequentialStep).agent];
 		ctx.pi.events.emit("subagent:started", {
 			id,
-			pid,
+			pid: chainPid,
 			agent: firstAgents[0],
 			task: isParallelStep(firstStep)
 				? firstStep.parallel[0]?.task?.slice(0, 50)
@@ -235,6 +262,7 @@ export function executeAsyncChain(
 			),
 			cwd: runnerCwd,
 			asyncDir,
+			stdinWriter: chainStdinWriter,
 		});
 	}
 
@@ -275,7 +303,7 @@ export function executeAsyncSingle(
 	const runnerCwd = cwd ?? ctx.cwd;
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
-	const pid = spawnRunner(
+	const { pid: singlePid, stdinWriter: singleStdinWriter } = spawnRunner(
 		{
 			id,
 			steps: [
@@ -308,14 +336,15 @@ export function executeAsyncSingle(
 		runnerCwd,
 	);
 
-	if (pid) {
+	if (singlePid) {
 		ctx.pi.events.emit("subagent:started", {
 			id,
-			pid,
+			pid: singlePid,
 			agent,
 			task: task?.slice(0, 50),
 			cwd: runnerCwd,
 			asyncDir,
+			stdinWriter: singleStdinWriter,
 		});
 	}
 

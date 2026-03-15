@@ -54,6 +54,8 @@ import { finalizeSingleOutput, injectSingleOutputInstruction, resolveSingleOutpu
 import { AgentManagerComponent, type ManagerResult } from "./agent-manager.js";
 import { recordRun } from "./run-history.js";
 import { handleManagementAction } from "./agent-management.js";
+import { registerSubagentsCommand } from "./subagents-command.js";
+import { registerObserveTool } from "./observe.js";
 
 // ExtensionConfig is now imported from ./types.js
 
@@ -1168,6 +1170,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		},
 	});
 
+
+	registerSubagentsCommand(pi, asyncJobs, () => currentSessionId);
+	registerObserveTool(pi);
 	pi.registerCommand("run", {
 		description: "Run a subagent directly: /run agent[output=file] task [--bg]",
 		getArgumentCompletions: makeAgentCompletions(false),
@@ -1325,6 +1330,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			asyncDir?: string;
 			agent?: string;
 			chain?: string[];
+			stdinWriter?: (data: string) => boolean;
 		};
 		if (!info.id) return;
 		const asyncDir = info.asyncDir ?? path.join(ASYNC_DIR, info.id);
@@ -1339,6 +1345,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			stepsTotal: agents?.length,
 			startedAt: now,
 			updatedAt: now,
+			stdinWriter: info.stdinWriter,
 		});
 		if (lastUiContext) {
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
@@ -1355,6 +1362,8 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			job.status = result.success ? "complete" : "failed";
 			job.updatedAt = Date.now();
 			if (result.asyncDir) job.asyncDir = result.asyncDir;
+			// Clear stdin writer — job is done, no more steering commands can be sent
+			job.stdinWriter = undefined;
 		}
 		if (lastUiContext) {
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
