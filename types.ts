@@ -210,6 +210,8 @@ export interface RunSyncOptions {
 	artifactConfig?: ArtifactConfig;
 	runId: string;
 	index?: number;
+	/** Total number of tasks (for parallel execution labeling) */
+	total?: number;
 	sessionDir?: string;
 	share?: boolean;
 	/** Override the agent's default model (format: "provider/id" or just "id") */

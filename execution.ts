@@ -34,6 +34,7 @@ import {
 import { buildSkillInjection, resolveSkills } from "./skills.js";
 import { getPiSpawnCommand } from "./pi-spawn.js";
 import { createJsonlWriter } from "./jsonl-writer.js";
+import { isNestEnabled, broadcastStart, broadcastToolActivity, broadcastComplete } from "./nest-broadcast.js";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -54,7 +55,7 @@ export async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, modelOverride } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, total, modelOverride } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -205,6 +206,12 @@ export async function runSync(
 		});
 		const jsonlWriter = createJsonlWriter(jsonlPath, proc.stdout);
 		closeJsonlWriter = () => jsonlWriter.close();
+
+		// Broadcast subagent start to Nest (if running inside Nest)
+		if (isNestEnabled) {
+			broadcastStart(agentName, task, index, total);
+		}
+
 		let buf = "";
 
 		// Throttled update mechanism - consolidates all updates
@@ -266,6 +273,11 @@ export async function runSync(
 					// Tool start is important - update immediately by forcing throttle reset
 					lastUpdateTime = 0;
 					scheduleUpdate();
+
+					// Broadcast tool activity to Nest (debounced internally)
+					if (isNestEnabled && evt.toolName) {
+						broadcastToolActivity(agentName, evt.toolName, progress.toolCount, index, total);
+					}
 				}
 
 				if (evt.type === "tool_execution_end") {
@@ -399,6 +411,11 @@ export async function runSync(
 		if (progress.currentTool) {
 			progress.failedTool = progress.currentTool;
 		}
+	}
+
+	// Broadcast subagent completion to Nest
+	if (isNestEnabled) {
+		broadcastComplete(agentName, result.exitCode, progress.durationMs, result.error, index, total);
 	}
 
 	result.progress = progress;

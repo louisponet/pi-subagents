@@ -53,6 +53,7 @@ import { discoverAvailableSkills, normalizeSkillInput } from "./skills.js";
 import { finalizeSingleOutput, injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.js";
 import { AgentManagerComponent, type ManagerResult } from "./agent-manager.js";
 import { recordRun } from "./run-history.js";
+import { isNestEnabled, broadcastParallelStart, broadcastParallelComplete, broadcastChainStep } from "./nest-broadcast.js";
 import { handleManagementAction } from "./agent-management.js";
 import { registerSubagentsCommand } from "./subagents-command.js";
 import { registerObserveTool } from "./observe.js";
@@ -636,6 +637,13 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				const behaviors = agentConfigs.map(c => resolveStepBehavior(c, {}));
 				const liveResults: (SingleResult | undefined)[] = new Array(params.tasks.length).fill(undefined);
 				const liveProgress: (AgentProgress | undefined)[] = new Array(params.tasks.length).fill(undefined);
+				const parallelStartTime = Date.now();
+
+				// Broadcast parallel start to Nest
+				if (isNestEnabled) {
+					broadcastParallelStart(params.tasks.map((t, i) => ({ agent: t.agent, task: tasks[i]! })));
+				}
+
 				const results = await mapConcurrent(params.tasks, MAX_CONCURRENCY, async (t, i) => {
 					const overrideSkills = skillOverrides[i];
 					const effectiveSkills = overrideSkills === undefined ? behaviors[i]?.skills : overrideSkills;
@@ -644,6 +652,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						signal,
 						runId,
 						index: i,
+						total: params.tasks!.length,
 						sessionDir: sessionDirForIndex(i),
 						share: shareEnabled,
 						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
@@ -683,6 +692,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				}
 
 				const ok = results.filter((r) => r.exitCode === 0).length;
+
+				// Broadcast parallel completion to Nest
+				if (isNestEnabled) {
+					broadcastParallelComplete(ok, results.length, Date.now() - parallelStartTime);
+				}
 				const downgradeNote = parallelDowngraded ? " (async not supported for parallel)" : "";
 
 				// Aggregate outputs from all parallel tasks

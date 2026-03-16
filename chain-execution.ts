@@ -29,6 +29,7 @@ import { runSync } from "./execution.js";
 import { buildChainSummary } from "./formatters.js";
 import { getFinalOutput, mapConcurrent } from "./utils.js";
 import { recordRun } from "./run-history.js";
+import { isNestEnabled, broadcastChainStep, broadcastParallelStart, broadcastParallelComplete } from "./nest-broadcast.js";
 import {
 	type AgentProgress,
 	type ArtifactConfig,
@@ -280,6 +281,15 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 
 			// Track if we should abort remaining tasks (for fail-fast)
 			let aborted = false;
+			const parallelChainStartTime = Date.now();
+
+			// Broadcast parallel chain step start to Nest
+			if (isNestEnabled) {
+				broadcastParallelStart(step.parallel.map((t, i) => ({
+					agent: t.agent,
+					task: parallelTemplates[i] ?? t.task ?? "(inherited)",
+				})));
+			}
 
 			// Execute parallel tasks
 			const parallelResults = await mapConcurrent(
@@ -332,6 +342,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						signal,
 						runId,
 						index: globalTaskIndex + taskIndex,
+						total: step.parallel.length,
 						sessionDir: sessionDirForIndex(globalTaskIndex + taskIndex),
 						share: shareEnabled,
 						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
@@ -369,6 +380,12 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 
 			// Update global task index
 			globalTaskIndex += step.parallel.length;
+
+			// Broadcast parallel chain step completion to Nest
+			if (isNestEnabled) {
+				const parallelOk = parallelResults.filter((r) => r.exitCode === 0).length;
+				broadcastParallelComplete(parallelOk, parallelResults.length, Date.now() - parallelChainStartTime);
+			}
 
 			// Collect results and progress
 			for (const r of parallelResults) {
@@ -481,6 +498,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				tuiOverride?.model
 				?? (seqStep.model ? resolveModelFullId(seqStep.model, availableModels) : null)
 				?? resolveModelFullId(agentConfig.model, availableModels);
+
+			// Broadcast chain step start to Nest
+			if (isNestEnabled) {
+				broadcastChainStep(stepIndex, chainSteps.length, seqStep.agent, cleanTask);
+			}
 
 			// Run step
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
