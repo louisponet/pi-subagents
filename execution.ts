@@ -276,7 +276,13 @@ export async function runSync(
 
 					// Broadcast tool activity to Nest (debounced internally)
 					if (isNestEnabled && evt.toolName) {
-						broadcastToolActivity(agentName, evt.toolName, progress.toolCount, index, total);
+						broadcastToolActivity(agentName, evt.toolName, progress.toolCount, index, total, {
+							task,
+							durationMs: progress.durationMs,
+							tokens: progress.tokens,
+							recentOutput: progress.recentOutput,
+							currentToolArgs: progress.currentToolArgs,
+						});
 					}
 				}
 
@@ -323,6 +329,17 @@ export async function runSync(
 							if (progress.recentOutput.length > 50) {
 								progress.recentOutput.splice(0, progress.recentOutput.length - 50);
 							}
+						}
+
+						// Update Nest status card with new output (debounced internally)
+						if (isNestEnabled) {
+							broadcastToolActivity(agentName, progress.currentTool ?? "thinking", progress.toolCount, index, total, {
+								task,
+								durationMs: progress.durationMs,
+								tokens: progress.tokens,
+								recentOutput: progress.recentOutput,
+								currentToolArgs: progress.currentToolArgs,
+							});
 						}
 					}
 					scheduleUpdate();
@@ -415,7 +432,12 @@ export async function runSync(
 
 	// Broadcast subagent completion to Nest
 	if (isNestEnabled) {
-		broadcastComplete(agentName, result.exitCode, progress.durationMs, result.error, index, total);
+		broadcastComplete(agentName, result.exitCode, progress.durationMs, result.error, index, total, {
+			task,
+			toolCount: progress.toolCount,
+			tokens: progress.tokens,
+			recentOutput: progress.recentOutput,
+		});
 	}
 
 	result.progress = progress;

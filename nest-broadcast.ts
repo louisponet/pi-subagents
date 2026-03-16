@@ -2,13 +2,18 @@
  * Nest broadcast integration for subagent visibility.
  *
  * When running inside a Nest session (NEST_URL + SERVER_TOKEN + NEST_SESSION env vars),
- * this module broadcasts subagent lifecycle events to the parent session's Discord channel
- * via Nest's /api/block HTTP endpoint.
+ * this module creates ONE persistent Discord message per subtask and EDITS it in-place
+ * as the agent progresses. No message spam — just live-updating status cards.
  *
- * Events:
- * - subagent:start  → "🔍 Scout starting: {task summary}"
- * - subagent:tool   → periodic tool activity updates (debounced)
- * - subagent:done   → "✅ Scout completed (12s)" or "❌ Scout failed (12s)"
+ * Each status message shows:
+ * - Color-coded status indicator (🟡 running, ✅ completed, ❌ failed)
+ * - Agent type, task summary, progress info
+ * - Current tool being used
+ * - Last 2 meaningful outputs from the agent
+ * - Duration and token usage
+ *
+ * Uses Nest's /api/block for initial create and /api/block/update for edits.
+ * The Discord plugin tracks blockId → Discord messageId for in-place editing.
  */
 
 import * as http from "node:http";
@@ -22,11 +27,14 @@ const NEST_SESSION = process.env.NEST_SESSION;
 /** Whether we're running inside Nest and can broadcast */
 export const isNestEnabled = Boolean(NEST_URL && SERVER_TOKEN && NEST_SESSION);
 
-/** Max length for task summary in start messages */
-const TASK_SUMMARY_MAX = 200;
+/** Max length for task summary */
+const TASK_SUMMARY_MAX = 120;
 
-/** Minimum interval between tool activity broadcasts per agent (ms) */
-const TOOL_BROADCAST_INTERVAL_MS = 8_000;
+/** Max characters for each recent output line */
+const OUTPUT_LINE_MAX = 150;
+
+/** Minimum interval between status updates per agent (ms) */
+const UPDATE_INTERVAL_MS = 3_000;
 
 /** Agent display names and icons */
 const AGENT_DISPLAY: Record<string, { icon: string; name: string }> = {
@@ -43,7 +51,14 @@ const DEFAULT_DISPLAY = { icon: "🤖", name: "Agent" };
 // ─── Internal State ──────────────────────────────────────
 
 let blockCounter = 0;
-const lastToolBroadcast = new Map<string, number>();
+
+/** Track per-agent block IDs and last update time */
+interface AgentBlock {
+	blockId: string;
+	lastUpdate: number;
+	created: boolean; // whether the initial block has been sent
+}
+const agentBlocks = new Map<string, AgentBlock>();
 
 // ─── Helpers ─────────────────────────────────────────────
 
@@ -51,11 +66,14 @@ function getDisplay(agentName: string): { icon: string; name: string } {
 	return AGENT_DISPLAY[agentName] ?? { ...DEFAULT_DISPLAY, name: agentName };
 }
 
-function truncateTask(task: string): string {
-	// Take first line or first N chars, whichever is shorter
-	const firstLine = task.split("\n")[0]?.trim() ?? task.trim();
-	if (firstLine.length <= TASK_SUMMARY_MAX) return firstLine;
-	return firstLine.slice(0, TASK_SUMMARY_MAX - 3) + "...";
+function agentKey(agentName: string, index?: number): string {
+	return `${agentName}-${index ?? 0}`;
+}
+
+function truncate(text: string, max: number): string {
+	const firstLine = text.split("\n")[0]?.trim() ?? text.trim();
+	if (firstLine.length <= max) return firstLine;
+	return firstLine.slice(0, max - 1) + "…";
 }
 
 function formatDuration(ms: number): string {
@@ -67,106 +85,318 @@ function formatDuration(ms: number): string {
 	return remainSecs > 0 ? `${mins}m ${remainSecs}s` : `${mins}m`;
 }
 
-/**
- * POST a display block to Nest's /api/block endpoint.
- * Fire-and-forget — errors are silently ignored.
- */
-function postBlock(fallback: string): void {
-	if (!isNestEnabled) return;
+function formatTokens(tokens: number): string {
+	if (tokens < 1000) return `${tokens}`;
+	if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k`;
+	return `${(tokens / 1_000_000).toFixed(1)}M`;
+}
 
-	const blockId = `subagent-${Date.now()}-${++blockCounter}`;
-	const body = JSON.stringify({
+/** Get the last N meaningful output lines, cleaned up */
+function getRecentOutputLines(recentOutput: string[], count: number): string[] {
+	// Filter out empty/whitespace-only lines and very short filler
+	const meaningful = recentOutput.filter(
+		(line) => line.trim().length > 5 && !line.startsWith("---") && !line.startsWith("```"),
+	);
+	return meaningful.slice(-count).map((line) => truncate(line, OUTPUT_LINE_MAX));
+}
+
+// ─── Status Message Builder ──────────────────────────────
+
+interface StatusInfo {
+	agentName: string;
+	status: "running" | "completed" | "failed";
+	task: string;
+	index?: number;
+	total?: number;
+	toolCount?: number;
+	currentTool?: string;
+	currentToolArgs?: string;
+	durationMs?: number;
+	tokens?: number;
+	recentOutput?: string[];
+	error?: string;
+}
+
+function buildStatusMessage(info: StatusInfo): string {
+	const { icon, name } = getDisplay(info.agentName);
+	const indexLabel = info.total && info.total > 1 ? ` [${(info.index ?? 0) + 1}/${info.total}]` : "";
+
+	// Status indicator
+	let statusIcon: string;
+	let statusText: string;
+	switch (info.status) {
+		case "running":
+			statusIcon = "🟡";
+			statusText = "Running";
+			break;
+		case "completed":
+			statusIcon = "✅";
+			statusText = "Completed";
+			break;
+		case "failed":
+			statusIcon = "❌";
+			statusText = "Failed";
+			break;
+	}
+
+	// Header
+	const header = `${statusIcon} ${icon} **${name}**${indexLabel} — ${statusText}`;
+
+	// Task summary
+	const taskLine = `> ${truncate(info.task, TASK_SUMMARY_MAX)}`;
+
+	// Stats line
+	const stats: string[] = [];
+	if (info.durationMs != null && info.durationMs > 0) {
+		stats.push(`⏱ ${formatDuration(info.durationMs)}`);
+	}
+	if (info.toolCount != null && info.toolCount > 0) {
+		stats.push(`🔨 ${info.toolCount} tools`);
+	}
+	if (info.tokens != null && info.tokens > 0) {
+		stats.push(`📊 ${formatTokens(info.tokens)} tokens`);
+	}
+
+	// Current tool
+	let toolLine = "";
+	if (info.status === "running" && info.currentTool) {
+		const argsPreview = info.currentToolArgs ? ` ${truncate(info.currentToolArgs, 60)}` : "";
+		toolLine = `\n🔧 \`${info.currentTool}\`${argsPreview}`;
+	}
+
+	// Recent outputs (last 2 meaningful lines)
+	let outputSection = "";
+	if (info.recentOutput && info.recentOutput.length > 0) {
+		const lines = getRecentOutputLines(info.recentOutput, 2);
+		if (lines.length > 0) {
+			const outputLines = lines.map((l) => `> ${l}`).join("\n");
+			outputSection = `\n📝 **Recent:**\n${outputLines}`;
+		}
+	}
+
+	// Error info
+	let errorSection = "";
+	if (info.error) {
+		errorSection = `\n⚠️ ${truncate(info.error, 200)}`;
+	}
+
+	// Compose message
+	const parts = [header, taskLine];
+	if (stats.length > 0) parts.push(stats.join("  ·  "));
+	if (toolLine) parts.push(toolLine);
+	if (outputSection) parts.push(outputSection);
+	if (errorSection) parts.push(errorSection);
+
+	return parts.join("\n");
+}
+
+// ─── HTTP Transport ──────────────────────────────────────
+
+function nestRequest(path: string, body: Record<string, unknown>): Promise<void> {
+	if (!isNestEnabled) return Promise.resolve();
+
+	return new Promise((resolve) => {
+		try {
+			const payload = JSON.stringify(body);
+			const url = new URL(path, NEST_URL);
+			const req = http.request(
+				{
+					hostname: url.hostname,
+					port: url.port,
+					path: url.pathname,
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"Content-Length": Buffer.byteLength(payload),
+						Authorization: `Bearer ${SERVER_TOKEN}`,
+					},
+					timeout: 5000,
+				},
+				(res) => {
+					res.resume();
+					resolve();
+				},
+			);
+			req.on("error", () => resolve());
+			req.on("timeout", () => {
+				req.destroy();
+				resolve();
+			});
+			req.write(payload);
+			req.end();
+		} catch {
+			resolve();
+		}
+	});
+}
+
+/** Create a new block (initial message) */
+function createBlock(blockId: string, text: string): Promise<void> {
+	return nestRequest("/api/block", {
 		session: NEST_SESSION,
 		block: {
 			id: blockId,
 			kind: "markdown",
-			data: { text: fallback },
-			fallback,
+			data: { text },
+			fallback: text,
 		},
 	});
+}
 
-	try {
-		const url = new URL("/api/block", NEST_URL);
-		const req = http.request(
-			{
-				hostname: url.hostname,
-				port: url.port,
-				path: url.pathname,
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Content-Length": Buffer.byteLength(body),
-					Authorization: `Bearer ${SERVER_TOKEN}`,
-				},
-				timeout: 3000,
-			},
-			(res) => {
-				// Drain response
-				res.resume();
-			},
-		);
-		req.on("error", () => {}); // Silently ignore
-		req.write(body);
-		req.end();
-	} catch {
-		// Silently ignore — don't break subagent execution
+/** Update an existing block (edit message in-place) */
+function updateBlock(blockId: string, text: string): Promise<void> {
+	return nestRequest("/api/block/update", {
+		session: NEST_SESSION,
+		id: blockId,
+		data: { text },
+		fallback: text,
+	});
+}
+
+/** Remove a block */
+function removeBlock(blockId: string): Promise<void> {
+	return nestRequest("/api/block/remove", {
+		session: NEST_SESSION,
+		id: blockId,
+	});
+}
+
+// ─── Block Management ────────────────────────────────────
+
+function getOrCreateBlockId(key: string): string {
+	const existing = agentBlocks.get(key);
+	if (existing) return existing.blockId;
+	const blockId = `sa-${Date.now()}-${++blockCounter}`;
+	agentBlocks.set(key, { blockId, lastUpdate: 0, created: false });
+	return blockId;
+}
+
+function shouldThrottle(key: string): boolean {
+	const block = agentBlocks.get(key);
+	if (!block) return false;
+	return Date.now() - block.lastUpdate < UPDATE_INTERVAL_MS;
+}
+
+function markUpdated(key: string): void {
+	const block = agentBlocks.get(key);
+	if (block) block.lastUpdate = Date.now();
+}
+
+async function sendOrUpdate(key: string, text: string): Promise<void> {
+	const block = agentBlocks.get(key);
+	if (!block) return;
+
+	if (!block.created) {
+		await createBlock(block.blockId, text);
+		block.created = true;
+	} else {
+		await updateBlock(block.blockId, text);
 	}
+	block.lastUpdate = Date.now();
 }
 
 // ─── Public API ──────────────────────────────────────────
 
 /**
- * Broadcast that a subagent is starting.
+ * Broadcast that a subagent is starting. Creates the persistent status message.
  */
 export function broadcastStart(agentName: string, task: string, index?: number, total?: number): void {
 	if (!isNestEnabled) return;
 
-	const { icon, name } = getDisplay(agentName);
-	const taskSummary = truncateTask(task);
-	const indexLabel = total && total > 1 ? ` [${(index ?? 0) + 1}/${total}]` : "";
+	const key = agentKey(agentName, index);
+	getOrCreateBlockId(key);
 
-	postBlock(`${icon} **${name}**${indexLabel} starting: ${taskSummary}`);
+	const message = buildStatusMessage({
+		agentName,
+		status: "running",
+		task,
+		index,
+		total,
+	});
+
+	sendOrUpdate(key, message);
 }
 
 /**
- * Broadcast tool activity for a running subagent (debounced).
+ * Update tool activity for a running subagent (throttled).
+ * Updates the persistent status message in-place.
  */
-export function broadcastToolActivity(agentName: string, toolName: string, toolCount: number, index?: number, total?: number): void {
+export function broadcastToolActivity(
+	agentName: string,
+	toolName: string,
+	toolCount: number,
+	index?: number,
+	total?: number,
+	extra?: {
+		task?: string;
+		currentToolArgs?: string;
+		durationMs?: number;
+		tokens?: number;
+		recentOutput?: string[];
+	},
+): void {
 	if (!isNestEnabled) return;
 
-	const key = `${agentName}-${index ?? 0}`;
-	const now = Date.now();
-	const last = lastToolBroadcast.get(key) ?? 0;
+	const key = agentKey(agentName, index);
+	if (shouldThrottle(key)) return;
 
-	if (now - last < TOOL_BROADCAST_INTERVAL_MS) return;
-	lastToolBroadcast.set(key, now);
+	const message = buildStatusMessage({
+		agentName,
+		status: "running",
+		task: extra?.task ?? "(running)",
+		index,
+		total,
+		toolCount,
+		currentTool: toolName,
+		currentToolArgs: extra?.currentToolArgs,
+		durationMs: extra?.durationMs,
+		tokens: extra?.tokens,
+		recentOutput: extra?.recentOutput,
+	});
 
-	const { icon, name } = getDisplay(agentName);
-	const indexLabel = total && total > 1 ? ` [${(index ?? 0) + 1}/${total}]` : "";
-
-	postBlock(`${icon} **${name}**${indexLabel} → \`${toolName}\` (${toolCount} tools used)`);
+	sendOrUpdate(key, message);
 }
 
 /**
- * Broadcast that a subagent completed.
+ * Broadcast that a subagent completed. Final update to the persistent message.
  */
-export function broadcastComplete(agentName: string, exitCode: number, durationMs: number, error?: string, index?: number, total?: number): void {
+export function broadcastComplete(
+	agentName: string,
+	exitCode: number,
+	durationMs: number,
+	error?: string,
+	index?: number,
+	total?: number,
+	extra?: {
+		task?: string;
+		toolCount?: number;
+		tokens?: number;
+		recentOutput?: string[];
+	},
+): void {
 	if (!isNestEnabled) return;
 
-	const { icon: _, name } = getDisplay(agentName);
-	const duration = formatDuration(durationMs);
-	const indexLabel = total && total > 1 ? ` [${(index ?? 0) + 1}/${total}]` : "";
+	const key = agentKey(agentName, index);
+	// Ensure block exists for the final update
+	getOrCreateBlockId(key);
 
-	// Clean up debounce state
-	const key = `${agentName}-${index ?? 0}`;
-	lastToolBroadcast.delete(key);
+	const message = buildStatusMessage({
+		agentName,
+		status: exitCode === 0 ? "completed" : "failed",
+		task: extra?.task ?? "(completed)",
+		index,
+		total,
+		toolCount: extra?.toolCount,
+		durationMs,
+		tokens: extra?.tokens,
+		recentOutput: extra?.recentOutput,
+		error,
+	});
 
-	if (exitCode === 0) {
-		postBlock(`✅ **${name}**${indexLabel} completed (${duration})`);
-	} else {
-		const errorSuffix = error ? `: ${truncateTask(error)}` : "";
-		postBlock(`❌ **${name}**${indexLabel} failed (${duration})${errorSuffix}`);
-	}
+	sendOrUpdate(key, message).then(() => {
+		// Clean up tracking state
+		agentBlocks.delete(key);
+	});
 }
 
 /**
@@ -175,10 +405,15 @@ export function broadcastComplete(agentName: string, exitCode: number, durationM
 export function broadcastChainStep(stepIndex: number, totalSteps: number, agentName: string, task: string): void {
 	if (!isNestEnabled) return;
 
-	const { icon, name } = getDisplay(agentName);
-	const taskSummary = truncateTask(task);
+	// Chain steps share a single persistent message keyed by step index
+	const key = `chain-${stepIndex}`;
+	getOrCreateBlockId(key);
 
-	postBlock(`${icon} **${name}** (step ${stepIndex + 1}/${totalSteps}): ${taskSummary}`);
+	const { icon, name } = getDisplay(agentName);
+	const taskSummary = truncate(task, TASK_SUMMARY_MAX);
+
+	const message = `🔗 **Chain Step ${stepIndex + 1}/${totalSteps}** — ${icon} ${name}\n> ${taskSummary}`;
+	sendOrUpdate(key, message);
 }
 
 /**
@@ -189,10 +424,13 @@ export function broadcastParallelStart(tasks: Array<{ agent: string; task: strin
 
 	const lines = tasks.map((t, i) => {
 		const { icon, name } = getDisplay(t.agent);
-		return `  ${i + 1}. ${icon} **${name}**: ${truncateTask(t.task)}`;
+		return `  ${i + 1}. ${icon} **${name}**: ${truncate(t.task, 80)}`;
 	});
 
-	postBlock(`⚡ Running **${tasks.length} agents** in parallel:\n${lines.join("\n")}`);
+	const key = "parallel-header";
+	getOrCreateBlockId(key);
+	const message = `⚡ Running **${tasks.length} agents** in parallel:\n${lines.join("\n")}`;
+	sendOrUpdate(key, message);
 }
 
 /**
@@ -205,5 +443,10 @@ export function broadcastParallelComplete(succeeded: number, total: number, dura
 	const allOk = succeeded === total;
 	const icon = allOk ? "✅" : "⚠️";
 
-	postBlock(`${icon} Parallel execution complete: **${succeeded}/${total}** succeeded (${duration})`);
+	// Update the parallel header message
+	const key = "parallel-header";
+	const message = `${icon} Parallel execution complete: **${succeeded}/${total}** succeeded (${duration})`;
+	sendOrUpdate(key, message).then(() => {
+		agentBlocks.delete(key);
+	});
 }
