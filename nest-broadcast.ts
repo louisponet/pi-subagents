@@ -36,17 +36,15 @@ const OUTPUT_LINE_MAX = 150;
 /** Minimum interval between status updates per agent (ms) */
 const UPDATE_INTERVAL_MS = 3_000;
 
-/** Agent display names and icons */
-const AGENT_DISPLAY: Record<string, { icon: string; name: string }> = {
-	scout: { icon: "🔍", name: "Scout" },
-	worker: { icon: "🔧", name: "Worker" },
-	planner: { icon: "📋", name: "Planner" },
-	"task-runner": { icon: "⚙️", name: "Task Runner" },
-	"context-gatherer": { icon: "📚", name: "Context Gatherer" },
-	reviewer: { icon: "🔎", name: "Reviewer" },
+/** Agent display names */
+const AGENT_NAMES: Record<string, string> = {
+	scout: "Scout",
+	worker: "Worker",
+	planner: "Planner",
+	"task-runner": "Task Runner",
+	"context-gatherer": "Context Gatherer",
+	reviewer: "Reviewer",
 };
-
-const DEFAULT_DISPLAY = { icon: "🤖", name: "Agent" };
 
 // ─── Internal State ──────────────────────────────────────
 
@@ -62,8 +60,8 @@ const agentBlocks = new Map<string, AgentBlock>();
 
 // ─── Helpers ─────────────────────────────────────────────
 
-function getDisplay(agentName: string): { icon: string; name: string } {
-	return AGENT_DISPLAY[agentName] ?? { ...DEFAULT_DISPLAY, name: agentName };
+function getAgentName(agentName: string): string {
+	return AGENT_NAMES[agentName] ?? agentName;
 }
 
 function agentKey(agentName: string, index?: number): string {
