@@ -46,6 +46,24 @@ const AGENT_NAMES: Record<string, string> = {
 	reviewer: "Reviewer",
 };
 
+/** Agent display icons */
+const AGENT_ICONS: Record<string, string> = {
+	scout: "🔍",
+	worker: "🔨",
+	planner: "📋",
+	"task-runner": "⚙️",
+	"context-gatherer": "📚",
+	reviewer: "🔎",
+};
+
+/** Get display icon and name for an agent */
+function getDisplay(agentName: string): { icon: string; name: string } {
+	return {
+		icon: AGENT_ICONS[agentName] ?? "🤖",
+		name: AGENT_NAMES[agentName] ?? agentName,
+	};
+}
+
 // ─── Internal State ──────────────────────────────────────
 
 let blockCounter = 0;
@@ -57,6 +75,61 @@ interface AgentBlock {
 	created: boolean; // whether the initial block has been sent
 }
 const agentBlocks = new Map<string, AgentBlock>();
+
+/** Session-level subagent usage counters (reset per pi process lifetime) */
+interface SessionStats {
+	spawned: number;
+	running: number;
+	completed: number;
+	failed: number;
+	byAgent: Record<string, number>;
+}
+const sessionStats: SessionStats = {
+	spawned: 0,
+	running: 0,
+	completed: 0,
+	failed: 0,
+	byAgent: {},
+};
+
+function trackStart(agentName: string): void {
+	sessionStats.spawned++;
+	sessionStats.running++;
+	sessionStats.byAgent[agentName] = (sessionStats.byAgent[agentName] ?? 0) + 1;
+}
+
+function trackComplete(exitCode: number): void {
+	sessionStats.running = Math.max(0, sessionStats.running - 1);
+	if (exitCode === 0) {
+		sessionStats.completed++;
+	} else {
+		sessionStats.failed++;
+	}
+}
+
+function buildStatsLine(): string {
+	const parts: string[] = [];
+	if (sessionStats.running > 0) {
+		parts.push(`${sessionStats.running} running`);
+	}
+	if (sessionStats.completed > 0) {
+		parts.push(`${sessionStats.completed} done`);
+	}
+	if (sessionStats.failed > 0) {
+		parts.push(`${sessionStats.failed} failed`);
+	}
+
+	// Agent type breakdown (compact: "scout ×3, worker ×2")
+	const breakdown = Object.entries(sessionStats.byAgent)
+		.sort((a, b) => b[1] - a[1])
+		.map(([agent, count]) => {
+			const { name } = getDisplay(agent);
+			return count > 1 ? `${name} ×${count}` : name;
+		})
+		.join(", ");
+
+	return `📊 **${sessionStats.spawned}** agents spawned (${parts.join(" · ")}) — ${breakdown}`;
+}
 
 // ─── Helpers ─────────────────────────────────────────────
 
@@ -152,7 +225,7 @@ function buildStatusMessage(info: StatusInfo): string {
 		stats.push(`🔨 ${info.toolCount} tools`);
 	}
 	if (info.tokens != null && info.tokens > 0) {
-		stats.push(`📊 ${formatTokens(info.tokens)} tokens`);
+		stats.push(`💬 ${formatTokens(info.tokens)} tokens`);
 	}
 
 	// Current tool
@@ -178,12 +251,19 @@ function buildStatusMessage(info: StatusInfo): string {
 		errorSection = `\n⚠️ ${truncate(info.error, 200)}`;
 	}
 
+	// Session-wide agent stats (only show if more than 1 agent has been spawned)
+	let sessionStatsLine = "";
+	if (sessionStats.spawned > 1) {
+		sessionStatsLine = `\n${buildStatsLine()}`;
+	}
+
 	// Compose message
 	const parts = [header, taskLine];
 	if (stats.length > 0) parts.push(stats.join("  ·  "));
 	if (toolLine) parts.push(toolLine);
 	if (outputSection) parts.push(outputSection);
 	if (errorSection) parts.push(errorSection);
+	if (sessionStatsLine) parts.push(sessionStatsLine);
 
 	return parts.join("\n");
 }
@@ -301,6 +381,8 @@ async function sendOrUpdate(key: string, text: string): Promise<void> {
 export function broadcastStart(agentName: string, task: string, index?: number, total?: number): void {
 	if (!isNestEnabled) return;
 
+	trackStart(agentName);
+
 	const key = agentKey(agentName, index);
 	getOrCreateBlockId(key);
 
@@ -373,6 +455,8 @@ export function broadcastComplete(
 	},
 ): void {
 	if (!isNestEnabled) return;
+
+	trackComplete(exitCode);
 
 	const key = agentKey(agentName, index);
 	// Ensure block exists for the final update
