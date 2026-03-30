@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
+import { unknownAgentError } from "./error-helpers.js";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride, type ModelInfo } from "./chain-clarify.js";
 import {
 	resolveChainTemplates,
@@ -164,7 +165,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			if (!config) {
 				removeChainDir(chainDir);
 				return {
-					content: [{ type: "text", text: `Unknown agent: ${step.agent}` }],
+					content: [{ type: "text", text: unknownAgentError(step.agent, agents) }],
 					isError: true,
 					details: { mode: "chain" as const, results: [] },
 				};
@@ -449,7 +450,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			if (!agentConfig) {
 				removeChainDir(chainDir);
 				return {
-					content: [{ type: "text", text: `Unknown agent: ${seqStep.agent}` }],
+					content: [{ type: "text", text: unknownAgentError(seqStep.agent, agents) }],
 					isError: true,
 					details: { mode: "chain" as const, results: [] },
 				};

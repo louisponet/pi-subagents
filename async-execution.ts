@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
+import { unknownAgentError } from "./error-helpers.js";
 import { applyThinkingSuffix } from "./execution.js";
 import { injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.js";
 import { isParallelStep, resolveStepBehavior, type ChainStep, type ParallelStep, type SequentialStep, type StepOverrides } from "./settings.js";
@@ -157,7 +158,7 @@ export function executeAsyncChain(
 		for (const agentName of stepAgents) {
 			if (!agents.find((x) => x.name === agentName)) {
 				return {
-					content: [{ type: "text", text: `Unknown agent: ${agentName}` }],
+					content: [{ type: "text", text: unknownAgentError(agentName, agents) }],
 					isError: true,
 					details: { mode: "chain" as const, results: [] },
 				};

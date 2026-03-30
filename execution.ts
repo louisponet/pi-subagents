@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig } from "./agents.js";
+import { unknownAgentError } from "./error-helpers.js";
 import {
 	ensureArtifactsDir,
 	getArtifactPaths,
@@ -64,7 +65,7 @@ export async function runSync(
 			exitCode: 1,
 			messages: [],
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-			error: `Unknown agent: ${agentName}`,
+			error: unknownAgentError(agentName, agents),
 		};
 	}
 

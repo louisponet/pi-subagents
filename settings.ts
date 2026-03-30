@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentConfig } from "./agents.js";
+import { unknownAgentError } from "./error-helpers.js";
 import { normalizeSkillInput } from "./skills.js";
 
 const CHAIN_RUNS_DIR = path.join(os.tmpdir(), "pi-chain-runs");
@@ -284,7 +285,7 @@ export function resolveParallelBehaviors(
 	return tasks.map((task, taskIndex) => {
 		const config = agentConfigs.find((a) => a.name === task.agent);
 		if (!config) {
-			throw new Error(`Unknown agent: ${task.agent}`);
+			throw new Error(unknownAgentError(task.agent, agentConfigs));
 		}
 
 		// Build subdirectory path for this parallel task

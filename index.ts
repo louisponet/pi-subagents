@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsAll } from "./agents.js";
+import { unknownAgentError } from "./error-helpers.js";
 import { resolveExecutionAgentScope } from "./agent-scope.js";
 import { cleanupOldChainDirs, getStepAgents, isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep } from "./settings.js";
 import { ChainClarifyComponent, type ChainClarifyResult, type ModelInfo } from "./chain-clarify.js";
@@ -237,6 +238,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		.filter((f) => f.endsWith(".json"))
 		.forEach((file) => resultFileCoalescer.schedule(file, 0));
 
+	// Discover agents at startup to include in tool description
+	const startupAgents = discoverAgents(baseCwd, "both").agents;
+	const agentNames = [...new Set(startupAgents.map((a) => a.name))];
+	const agentListLine = agentNames.length > 0
+		? `\n\nAvailable agents: ${agentNames.join(", ")} (use action: "list" for full details including chains)`
+		: "";
+
 	const tool: ToolDefinition<typeof SubagentParams, Details> = {
 		name: "subagent",
 		label: "Subagent",
@@ -265,7 +273,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 • { action: "create", config: { name, description, systemPrompt, ... } } - create agent/chain
 • { action: "update", agent: "name", config: { ... } } - modify fields (merge)
 • { action: "delete", agent: "name" } - remove definition
-• Use chainName instead of agent for chain operations`,
+• Use chainName instead of agent for chain operations` + agentListLine,
 		parameters: SubagentParams,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -392,7 +400,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					for (const agentName of stepAgents) {
 						if (!agents.find((a) => a.name === agentName)) {
 							return {
-								content: [{ type: "text", text: `Unknown agent: ${agentName} (step ${i + 1})` }],
+								content: [{ type: "text", text: unknownAgentError(agentName, agents, `(step ${i + 1})`) }],
 								isError: true,
 								details: { mode: "chain" as const, results: [] },
 							};
@@ -539,7 +547,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					const config = agents.find(a => a.name === t.agent);
 					if (!config) {
 						return {
-							content: [{ type: "text", text: `Unknown agent: ${t.agent}` }],
+							content: [{ type: "text", text: unknownAgentError(t.agent, agents) }],
 							isError: true,
 							details: { mode: "parallel" as const, results: [] },
 						};
@@ -738,7 +746,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				const agentConfig = agents.find((a) => a.name === params.agent);
 				if (!agentConfig) {
 					return {
-						content: [{ type: 'text', text: `Unknown agent: ${params.agent}` }],
+						content: [{ type: 'text', text: unknownAgentError(params.agent!, agents) }],
 						isError: true,
 						details: { mode: 'single', results: [] },
 					};
